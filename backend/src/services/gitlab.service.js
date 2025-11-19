@@ -126,3 +126,17 @@ export async function fetchGitlabProjectInfo(gitlabProjectUrl, gitlabAccessToken
   const res = await api.get(`/projects/${encodeURIComponent(path)}`);
   return res.data;
 }
+
+export async function retryPipeline(project, pipelineId) {
+  const api = createGitlabClient(project);
+  
+  try {
+    const res = await api.post(
+      `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/retry`
+    );
+    return res.data;
+  } catch (err) {
+    console.error('Failed to retry pipeline:', err.response?.data || err.message);
+    throw new Error(err.response?.data?.message || 'Failed to retry pipeline');
+  }
+}

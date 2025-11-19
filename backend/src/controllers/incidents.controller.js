@@ -15,6 +15,8 @@ export async function listIncidents(req, res, next) {
 
     const items = await Incident.find(filter)
       .populate("project", "name gitlabUrl")
+      .populate("aiAnalysis", "summary rootCause category confidence")
+      .populate("mergeRequest", "mrIid url branchName status")
       .sort({ createdAt: -1 });
 
     res.json({
@@ -37,7 +39,8 @@ export async function getIncident(req, res, next) {
     const incident = await Incident.findById(req.params.id)
       .populate("project", "name gitlabUrl")
       .populate("aiAnalysis")
-      .populate("aiPatch");
+      .populate("aiPatch")
+      .populate("mergeRequest");
 
     if (!incident) {
       return res.status(404).json({
@@ -89,12 +92,15 @@ export async function updateIncident(req, res, next) {
 
 export async function triggerAnalysis(req, res, next) {
   try {
+    console.log('🔍 triggerAnalysis called for incident:', req.params.id);
+    
     const incident = await Incident.findById(req.params.id).populate(
       "project",
       "name gitlabProjectId gitlabUrl"
     );
 
     if (!incident) {
+      console.log('❌ Incident not found:', req.params.id);
       return res.status(404).json({
         success: false,
         data: null,
@@ -102,6 +108,7 @@ export async function triggerAnalysis(req, res, next) {
       });
     }
 
+    console.log('📞 Calling AI RCA service...');
     const rca = await callRCA({
       incidentId: incident._id.toString(),
       logs: incident.fullLogs || "",
@@ -114,6 +121,7 @@ export async function triggerAnalysis(req, res, next) {
       }
     });
 
+    console.log('✅ AI RCA completed:', rca);
     const analysis = await AIAnalysis.create({
       incident: incident._id,
       summary: rca.summary,
@@ -123,29 +131,35 @@ export async function triggerAnalysis(req, res, next) {
     });
 
     incident.aiAnalysis = analysis._id;
+    incident.analysisStatus = "done"; // Mark analysis as complete
     if (!incident.category && rca.category) {
       incident.category = rca.category;
     }
     await incident.save();
 
+    console.log('✅ Analysis saved to DB');
     res.json({
       success: true,
       data: { aiAnalysis: analysis },
       error: null
     });
   } catch (err) {
+    console.error('❌ Error in triggerAnalysis:', err);
     next(err);
   }
 }
 
 export async function triggerPatch(req, res, next) {
   try {
+    console.log('🔧 triggerPatch called for incident:', req.params.id);
+    
     const incident = await Incident.findById(req.params.id).populate(
       "project",
       "name gitlabProjectId gitlabUrl"
     );
 
     if (!incident) {
+      console.log('❌ Incident not found:', req.params.id);
       return res.status(404).json({
         success: false,
         data: null,
@@ -153,6 +167,7 @@ export async function triggerPatch(req, res, next) {
       });
     }
 
+    console.log('📞 Calling AI Patch service...');
     // TODO: later fetch related repo files via GitLab; for now, empty
     const files = [];
 
@@ -169,6 +184,7 @@ export async function triggerPatch(req, res, next) {
       }
     });
 
+    console.log('✅ AI Patch generated');
     const patch = await AIPatch.create({
       incident: incident._id,
       diff: patchRes.diff,
@@ -177,8 +193,10 @@ export async function triggerPatch(req, res, next) {
     });
 
     incident.aiPatch = patch._id;
+    incident.patchStatus = "ready"; // Mark patch as ready
     await incident.save();
 
+    console.log('✅ Patch saved to DB, status set to ready');
     res.json({
       success: true,
       data: { aiPatch: patch },
@@ -203,8 +221,12 @@ export async function createMergeRequest(req, res, next) {
 
 export async function rerunPipeline(req, res, next) {
   try {
-    const incident = await Incident.findById(req.params.id);
+    console.log('🔄 rerunPipeline called for incident:', req.params.id);
+    
+    const incident = await Incident.findById(req.params.id).populate('project');
+    
     if (!incident) {
+      console.log('❌ Incident not found:', req.params.id);
       return res.status(404).json({
         success: false,
         data: null,
@@ -212,17 +234,40 @@ export async function rerunPipeline(req, res, next) {
       });
     }
 
-    // TODO: Use GitLab API to retry pipeline
+    if (!incident.pipelineId) {
+      console.log('❌ No pipeline ID found for incident');
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: { code: "NO_PIPELINE", message: "No pipeline associated with this incident" }
+      });
+    }
+
+    if (!incident.project) {
+      console.log('❌ No project associated with incident');
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: { code: "NO_PROJECT", message: "No project associated with this incident" }
+      });
+    }
+
+    console.log('📞 Calling GitLab API to retry pipeline:', incident.pipelineId);
+    const { retryPipeline } = await import("../services/gitlab.service.js");
+    const pipelineData = await retryPipeline(incident.project, incident.pipelineId);
+
+    console.log('✅ Pipeline retry triggered:', pipelineData.id);
     res.json({
       success: true,
       data: {
-        pipelineId: incident.pipelineId,
-        pipelineUrl: incident.pipelineUrl,
-        status: "pending"
+        pipelineId: pipelineData.id,
+        pipelineUrl: pipelineData.web_url,
+        status: pipelineData.status
       },
       error: null
     });
   } catch (err) {
+    console.error('❌ Error in rerunPipeline:', err);
     next(err);
   }
 }
