@@ -239,4 +239,4 @@ app.post("/ai/generate-patch", async (req, res) => {
 // ---------------------------------------------
 app.listen(PORT, () =>
   console.log(`AI service running (GROQ -> GEMINI fallback) on ${PORT}`)
-);
+); 

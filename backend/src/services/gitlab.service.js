@@ -1,142 +1,124 @@
+// backend/src/services/gitlab.service.js
 import axios from "axios";
-import { Buffer } from "buffer";
+import logger from "../utils/logger.js";
 
-const GITLAB_BASE_URL = process.env.GITLAB_BASE_URL || "https://gitlab.com/api/v4";
-
-export function createGitlabClient(project) {
+const BASE = process.env.GITLAB_BASE_URL?.replace(/\/$/, "") || "https://gitlab.com";
+function gitlabClient(projectOrToken) {
+  const token = projectOrToken?.gitlabAccessToken || projectOrToken;
   return axios.create({
-    baseURL: GITLAB_BASE_URL,
-    headers: {
-      "Private-Token": project.gitlabAccessToken,
-      "Content-Type": "application/json"
-    }
+    baseURL: `${BASE}/api/v4`,
+    headers: { "PRIVATE-TOKEN": token }
   });
 }
 
-export async function createBranch(project, branch, base = "main") {
-  const api = createGitlabClient(project);
-
+export async function fetchGitlabProjectInfo(token, projectIdOrPath) {
   try {
-    const res = await api.post(
-      `/projects/${project.gitlabProjectId}/repository/branches`,
-      { branch, ref: base }
-    );
+    const client = gitlabClient(token);
+    const encoded = encodeURIComponent(String(projectIdOrPath));
+    const res = await client.get(`/projects/${encoded}`);
     return res.data;
   } catch (err) {
-    if (err.response?.data?.message === "Branch already exists") {
-      return { exists: true };
-    }
+    logger.error("[GITLAB] fetchGitlabProjectInfo:", err.response?.data || err.message);
     throw err;
   }
 }
 
-export async function getFile(project, path, ref = "main") {
-  const api = createGitlabClient(project);
-
-  const res = await api.get(
-    `/projects/${project.gitlabProjectId}/repository/files/${encodeURIComponent(path)}`,
-    { params: { ref } }
-  );
-
-  return Buffer.from(res.data.content, "base64").toString("utf8");
-}
-
-export async function commitFile(project, branch, filePath, content, message, isNew) {
-  const api = createGitlabClient(project);
-
-  const res = await api.post(
-    `/projects/${project.gitlabProjectId}/repository/commits`,
-    {
-      branch,
-      commit_message: message,
-      actions: [
-        {
-          action: isNew ? "create" : "update",
-          file_path: filePath,
-          content
-        }
-      ]
-    }
-  );
-
-  return res.data;
-}
-
-export async function createMR(project, branch, title, description) {
-  const api = createGitlabClient(project);
-
-  const res = await api.post(
-    `/projects/${project.gitlabProjectId}/merge_requests`,
-    {
-      source_branch: branch,
-      target_branch: "main",
-      title,
-      description,
-      squash: true,
-      remove_source_branch: true
-    }
-  );
-
-  return res.data;
-}
-
-export async function fetchPipeline(project, pipelineId) {
-  const api = createGitlabClient(project);
-  const res = await api.get(
-    `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}`
-  );
-  return res.data;
-}
-
-export async function fetchPipelineJobs(project, pipelineId) {
-  const api = createGitlabClient(project);
-  const res = await api.get(
-    `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/jobs`
-  );
-  return res.data || [];
-}
-
-export async function fetchJobLog(project, jobId) {
-  const api = createGitlabClient(project);
-  const res = await api.get(
-    `/projects/${project.gitlabProjectId}/jobs/${jobId}/trace`
-  );
-  return res.data;
-}
-
-export async function fetchGitlabCiConfig(project, ref = "main") {
+export async function getPipelineLogs(project, jobId) {
+  const client = gitlabClient(project);
   try {
-    return await getFile(project, ".gitlab-ci.yml", ref);
+    logger.info(`[GITLAB] Fetching logs for job ${jobId}`);
+    const res = await client.get(`/projects/${project.gitlabProjectId}/jobs/${jobId}/trace`, { responseType: "text" });
+    return res.data || "";
   } catch (err) {
-    console.warn("CI config not found:", err.message);
-    return null;
+    logger.error("[GITLAB] Pipeline logs error:", err.response?.data || err.message);
+    throw err;
   }
 }
 
-export async function fetchGitlabProjectInfo(gitlabProjectUrl, gitlabAccessToken) {
-  const api = axios.create({
-    baseURL: GITLAB_BASE_URL,
-    headers: {
-      "Private-Token": gitlabAccessToken,
-      "Content-Type": "application/json"
-    }
-  });
-
-  const path = new URL(gitlabProjectUrl).pathname.replace(/^\/+/, "");
-  const res = await api.get(`/projects/${encodeURIComponent(path)}`);
-  return res.data;
+export async function getCiConfig(project, ref = "main") {
+  const client = gitlabClient(project);
+  try {
+    const res = await client.get(`/projects/${project.gitlabProjectId}/repository/files/.gitlab-ci.yml/raw`, { params: { ref }, responseType: "text" });
+    return res.data || "";
+  } catch (err) {
+    logger.warn("[GITLAB] getCiConfig not found:", err.response?.data?.message || err.message);
+    return "";
+  }
 }
 
-export async function retryPipeline(project, pipelineId) {
-  const api = createGitlabClient(project);
-  
+export async function listRepoTree(project, gitRef = "main") {
+  const client = gitlabClient(project);
   try {
-    const res = await api.post(
-      `/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/retry`
-    );
+    logger.info(`[GITLAB] Fetching repo tree for ${gitRef}`);
+    const res = await client.get(`/projects/${project.gitlabProjectId}/repository/tree`, { params: { ref: gitRef, recursive: true, per_page: 500 } });
+    return res.data || [];
+  } catch (err) {
+    logger.error("[GITLAB] listRepoTree error:", err.response?.data || err.message);
+    throw err;
+  }
+}
+
+export async function fetchFile(project, filePath, gitRef = "main") {
+  const client = gitlabClient(project);
+  try {
+    const encoded = encodeURIComponent(filePath);
+    logger.info(`[GITLAB] Fetching file ${filePath}`);
+    const res = await client.get(`/projects/${project.gitlabProjectId}/repository/files/${encoded}/raw`, { params: { ref: gitRef }, responseType: "text" });
+    return res.data || "";
+  } catch (err) {
+    logger.warn(`[GITLAB] fetchFile ${filePath} failed:`, err.response?.data || err.message);
+    throw err;
+  }
+}
+
+export async function createBranchForPatch(project, branchName, baseRef = "main") {
+  const client = gitlabClient(project);
+  try {
+    logger.info(`[GITLAB] Creating branch ${branchName}`);
+    const res = await client.post(`/projects/${project.gitlabProjectId}/repository/branches`, { branch: branchName, ref: baseRef });
     return res.data;
   } catch (err) {
-    console.error('Failed to retry pipeline:', err.response?.data || err.message);
-    throw new Error(err.response?.data?.message || 'Failed to retry pipeline');
+    const data = err.response?.data;
+    if (data?.message === "Branch already exists" || data?.message?.branch) {
+      logger.warn("[GITLAB] Branch already exists", branchName);
+      return { exists: true };
+    }
+    logger.error("[GITLAB] createBranchForPatch error:", data || err.message);
+    throw err;
+  }
+}
+
+export async function commitFiles(project, branch, commitMessage, actions = []) {
+  const client = gitlabClient(project);
+  try {
+    logger.info(`[GITLAB] Committing ${actions.length} actions to ${branch}`);
+    const res = await client.post(`/projects/${project.gitlabProjectId}/repository/commits`, { branch, commit_message: commitMessage, actions });
+    return res.data;
+  } catch (err) {
+    logger.error("[GITLAB] commitFiles error:", err.response?.data || err.message);
+    throw err;
+  }
+}
+
+export async function createMergeRequest(project, sourceBranch, targetBranch, title, description) {
+  const client = gitlabClient(project);
+  try {
+    logger.info(`[GITLAB] Creating MR ${title}`);
+    const res = await client.post(`/projects/${project.gitlabProjectId}/merge_requests`, { source_branch: sourceBranch, target_branch: targetBranch, title, description, remove_source_branch: false });
+    return res.data;
+  } catch (err) {
+    logger.error("[GITLAB] createMergeRequest error:", err.response?.data || err.message);
+    throw err;
+  }
+}
+
+export async function fetchPipelineJobs(project, pipelineId) {
+  const client = gitlabClient(project);
+  try {
+    const res = await client.get(`/projects/${project.gitlabProjectId}/pipelines/${pipelineId}/jobs`);
+    return res.data || [];
+  } catch (err) {
+    logger.error("[GITLAB] fetchPipelineJobs error:", err.response?.data || err.message);
+    throw err;
   }
 }

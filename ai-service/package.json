@@ -2,10 +2,10 @@
   "name": "ai-incident-copilot-ai-service",
   "version": "1.0.0",
   "type": "module",
-  "main": "src/index.js",
+  "main": "src/ai.service.js",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "start": "node src/index.js"
+    "dev": "nodemon src/ai.service.js",
+    "start": "node src/ai.service.js"
   },
   "dependencies": {
     "axios": "^1.7.2",

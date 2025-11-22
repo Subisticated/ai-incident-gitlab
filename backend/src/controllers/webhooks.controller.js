@@ -1,160 +1,64 @@
+// backend/src/controllers/webhooks.controller.js
+import express from "express";
+import logger from "../utils/logger.js";
 import { Project } from "../models/Project.js";
 import { Incident } from "../models/Incident.js";
-import { runAutomationForIncident, handlePostMRPipeline } from "../services/automation.service.js";
-import {
-  fetchPipelineJobs,
-  fetchJobLog,
-  fetchGitlabCiConfig
-} from "../services/gitlab.service.js";
+import { runAutomationForIncident } from "../services/automation.service.js";
 
-function extractErrorSnippet(logs = "") {
-  const lines = logs.split("\n").filter(Boolean);
-  return lines.slice(-5).join("\n").slice(0, 1000);
+export const router = express.Router();
+
+function extractFailedJob(body) {
+  return body.builds?.find(b => b.status === "failed") || body.jobs?.find(j => j.status === "failed") || null;
 }
 
-export async function handleGitlabWebhook(req, res, next) {
+async function handleGitlabWebhook(req, res) {
   try {
-    const event = req.header("X-Gitlab-Event");
-    if (event !== "Pipeline Hook") {
-      return res.json({
-        success: true,
-        data: { ignored: true, reason: "Not a Pipeline Hook event" },
-        error: null
-      });
-    }
+    const event = req.headers["x-gitlab-event"];
+    logger.info(`[WEBHOOK] Event: ${event}`);
+    if (event !== "Pipeline Hook") return res.json({ success: true, ignored: true });
 
-    const payload = req.body;
-    const pipeline = payload.object_attributes;
-    const projectInfo = payload.project;
+    const body = req.body;
+    const pipeline = body.object_attributes || {};
+    logger.info("[WEBHOOK] Pipeline status:", pipeline.status);
 
-    if (!pipeline || !projectInfo) {
-      return res.json({
-        success: true,
-        data: { ignored: true, reason: "Missing pipeline or project info" },
-        error: null
-      });
-    }
+    if (pipeline.status !== "failed") return res.json({ success: true, ignored: true });
 
-    const gitlabProjectId = projectInfo.id;
-    const gitlabProjectWebUrl = projectInfo.web_url;
+    const projectInfo = body.project || {};
+    const failedJob = extractFailedJob(body);
+    if (!failedJob) { logger.warn("[WEBHOOK] No failed job found"); return res.status(400).json({ error: "NO_FAILED_JOB" }); }
 
-    let project = null;
+    // DEMO MODE: Force fixed projectId because GitLab webhooks send inconsistent IDs
+    const FORCED_PROJECT_ID = 76116069;
 
-    if (gitlabProjectId) {
-      project = await Project.findOne({ gitlabProjectId });
-    }
-    if (!project && gitlabProjectWebUrl) {
-      project = await Project.findOne({ gitlabUrl: gitlabProjectWebUrl });
-    }
+    const project = await Project.findOne({ gitlabProjectId: FORCED_PROJECT_ID });
 
-    if (!project) {
-      return res.json({
-        success: true,
-        data: { ignored: true, reason: "Project not registered" },
-        error: null
-      });
-    }
-
-    const pipelineId = pipeline.id;
-    const ref = pipeline.ref;
-
-    // Route MR pipelines to retry handler
-    if (ref && ref.startsWith("incident-fix-")) {
-      let logs = null;
-      if (pipeline.status === "failed") {
-        try {
-          const jobs = await fetchPipelineJobs(project, pipelineId);
-          const failingJob = jobs.find((j) => j.status === "failed");
-          if (failingJob) {
-            logs = await fetchJobLog(project, failingJob.id);
-          }
-        } catch (err) {
-          console.warn("Failed to fetch MR pipeline logs:", err.message);
-        }
-      }
-
-      await handlePostMRPipeline(
-        {
-          ref,
-          status: pipeline.status,
-          id: pipelineId
-        },
-        logs
-      );
-
-      return res.json({
-        success: true,
-        data: { handled: "mr_pipeline" },
-        error: null
-      });
-    }
-
-    if (pipeline.status !== "failed") {
-      return res.json({
-        success: true,
-        data: { ignored: true, reason: `status=${pipeline.status}` },
-        error: null
-      });
-    }
-
-    const commitSha = pipeline.sha;
-    const pipelineUrl =
-      pipeline.web_url || `${project.gitlabUrl}/-/pipelines/${pipelineId}`;
-
-    let jobs = [];
-    try {
-      jobs = await fetchPipelineJobs(project, pipelineId);
-    } catch (err) {
-      console.warn("Failed to fetch jobs for pipeline:", err.message);
-    }
-
-    const failingJob =
-      jobs.find((job) => job.status === "failed") || jobs[0] || null;
-
-    let fullLogs = "";
-    if (failingJob) {
-      try {
-        fullLogs = await fetchJobLog(project, failingJob.id);
-      } catch (err) {
-        console.warn("Failed to fetch job log:", err.message);
-      }
-    }
-
-    let gitlabCiConfig = null;
-    try {
-      gitlabCiConfig = await fetchGitlabCiConfig(project, ref);
-    } catch (err) {
-      console.warn("Failed to fetch .gitlab-ci.yml:", err.message);
-    }
+    logger.info("[WEBHOOK] (Demo) Forced project lookup ->", FORCED_PROJECT_ID);
+    if (!project) { logger.error("[WEBHOOK] Unknown project id", projectInfo.id); return res.status(404).json({ error: "PROJECT_NOT_FOUND" }); }
 
     const incident = await Incident.create({
       project: project._id,
-      pipelineId,
-      pipelineUrl,
-      jobId: failingJob?.id || null,
-      jobName: failingJob?.name || null,
-      gitRef: ref,
-      commitSha,
+      pipelineId: pipeline.id,
+      pipelineUrl: pipeline.url,
+      jobId: failedJob.id,
+      jobName: failedJob.name,
+      gitRef: pipeline.ref,
+      commitSha: body.commit?.id,
       status: "open",
       analysisStatus: "pending",
       patchStatus: "pending",
       mrStatus: "not_requested",
-      errorSnippet: extractErrorSnippet(fullLogs),
-      logsStored: Boolean(fullLogs),
-      fullLogs,
-      gitlabCiConfig
+      errorSnippet: failedJob.failure_reason || "",
+      logsStored: false
     });
 
-    runAutomationForIncident(incident._id).catch((err) =>
-      console.error("Automation async error:", err.message)
-    );
-
-    return res.status(201).json({
-      success: true,
-      data: { incidentId: incident._id },
-      error: null
-    });
+    logger.success(`[WEBHOOK] Incident created: ${incident._id}`);
+    runAutomationForIncident(incident._id).catch(e => logger.error("[AUTO] async error", e.message || e));
+    return res.json({ success: true, incidentId: incident._id });
   } catch (err) {
-    next(err);
+    logger.error("[WEBHOOK] Handler error:", err.stack || err.message);
+    return res.status(500).json({ error: err.message });
   }
 }
+
+router.post("/gitlab", handleGitlabWebhook);
+export default router;

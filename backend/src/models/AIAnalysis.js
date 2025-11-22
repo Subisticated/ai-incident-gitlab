@@ -7,16 +7,17 @@ const aiAnalysisSchema = new mongoose.Schema(
       ref: "Incident",
       required: true
     },
-    summary: { type: String, required: true },
-    rootCause: { type: String, required: true },
-    category: {
-      type: String,
-      enum: ["config", "dependency", "test", "infra", "timeout", "other"],
-      required: true
-    },
-    confidence: { type: Number, default: 0 }
+
+    summary: String,
+    rootCause: String,
+    category: String,
+    confidence: Number,
+
+    usedModel: String,
+    safeMode: Boolean
   },
   { timestamps: true }
 );
 
-export const AIAnalysis = mongoose.model("AIAnalysis", aiAnalysisSchema);
+export const AIAnalysis =
+  mongoose.models.AIAnalysis || mongoose.model("AIAnalysis", aiAnalysisSchema);

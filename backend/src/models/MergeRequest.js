@@ -7,18 +7,26 @@ const mergeRequestSchema = new mongoose.Schema(
       ref: "Incident",
       required: true
     },
-    mrId: { type: Number, required: true },
-    mrIid: { type: Number, required: true },
-    url: { type: String, required: true },
-    branchName: { type: String, required: true },
+
+    project: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Project",
+      required: true
+    },
+
+    mrId: Number,
+    mrUrl: String,
+    sourceBranch: String,
+    targetBranch: String,
+
     status: {
       type: String,
-      enum: ["opened", "merged", "closed"],
-      default: "opened"
-    },
-    lastCheckedAt: { type: Date }
+      enum: ["open", "merged", "closed", "failed"],
+      default: "open"
+    }
   },
   { timestamps: true }
 );
 
-export const MergeRequest = mongoose.model("MergeRequest", mergeRequestSchema);
+export const MergeRequest =
+  mongoose.models.MergeRequest || mongoose.model("MergeRequest", mergeRequestSchema);

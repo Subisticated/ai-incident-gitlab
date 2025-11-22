@@ -1,349 +1,113 @@
+// backend/src/services/automation.service.js
+import logger, { log } from "../utils/logger.js";
 import { Incident } from "../models/Incident.js";
-import { Project } from "../models/Project.js";
 import { AIAnalysis } from "../models/AIAnalysis.js";
 import { AIPatch } from "../models/AIPatch.js";
-import { MergeRequest } from "../models/MergeRequest.js";
-
-import { callRCA, callGeneratePatch } from "./ai.service.js";
-import {
-  createBranch,
-  getFile,
-  commitFile,
-  createMR
-} from "./gitlab.service.js";
-
-import { cleanDiff, extractFilePath, isNewFile } from "../utils/diffParser.js";
-import {
-  applyPatchNewFile,
-  applyPatchExistingFile
-} from "../utils/patchEngine.js";
-
-// -------------- 1. Full automation for a NEW incident --------------
+import { getRepoSnapshot } from "./repoContext.service.js";
+import { runRCA, runPatchGeneration } from "./ai.service.js";
+import { validateUnifiedDiff } from "./patchValidator.js";
 
 export async function runAutomationForIncident(incidentId) {
+  logger.info(`[AUTO] runAutomationForIncident(${incidentId})`);
   const incident = await Incident.findById(incidentId).populate("project");
+  if (!incident) {
+    logger.error(`[AUTO] Incident not found: ${incidentId}`);
+    return;
+  }
 
-  if (!incident || !incident.project) return;
-
-  // Avoid double-running
-  if (incident.analysisStatus !== "pending") return;
+  if (["running"].includes(incident.analysisStatus) || ["running"].includes(incident.patchStatus)) {
+    logger.warn(`[AUTO] Already processing: ${incidentId}`);
+    return;
+  }
 
   try {
-    incident.status = "in_progress";
     incident.analysisStatus = "running";
+    incident.patchStatus = "pending";
     await incident.save();
 
-    // 1) Run AI Analysis
-    const rca = await callRCA({
-      incidentId: incident._id.toString(),
-      logs: incident.fullLogs || "",
-      gitlabCiConfig: incident.gitlabCiConfig || "",
-      metadata: {
-        projectName: incident.project.name,
-        pipelineId: incident.pipelineId,
-        jobName: incident.jobName,
-        gitRef: incident.gitRef
-      }
-    });
+    const logs = incident.fullLogs || "";
+    const ciConfig = incident.gitlabCiConfig || "";
 
-    const analysis = await AIAnalysis.create({
+    const rca = await runRCA({ logs, gitlabCiConfig: ciConfig, metadata: { pipelineId: incident.pipelineId, gitRef: incident.gitRef } });
+
+    const analysisDoc = await AIAnalysis.create({
       incident: incident._id,
-      summary: rca.summary,
-      rootCause: rca.rootCause,
-      category: rca.category,
-      confidence: rca.confidence
+      summary: rca.summary || "",
+      rootCause: rca.rootCause || "",
+      category: rca.category || "other",
+      confidence: rca.confidence || 0
     });
 
-    incident.aiAnalysis = analysis._id;
+    incident.aiAnalysis = analysisDoc._id;
     incident.analysisStatus = "done";
-    if (!incident.category && rca.category) {
-      incident.category = rca.category;
-    }
     await incident.save();
+    logger.success("[AUTO] RCA saved");
 
-    // 2) Run AI Patch generation
-    incident.patchStatus = "running";
-    await incident.save();
+    const repoSnapshot = await getRepoSnapshot(incident.project, incident.gitRef || "main");
 
-    const patchRes = await callGeneratePatch({
-      incidentId: incident._id.toString(),
-      logs: incident.fullLogs || "",
-      gitlabCiConfig: incident.gitlabCiConfig || "",
-      files: [],
-      metadata: {
-        projectName: incident.project.name,
-        pipelineId: incident.pipelineId,
-        jobName: incident.jobName,
-        gitRef: incident.gitRef
-      }
-    });
-
-    const patch = await AIPatch.create({
-      incident: incident._id,
-      diff: patchRes.diff,
-      description: patchRes.description,
-      riskLevel: patchRes.risk || "medium"
-    });
-
-    incident.aiPatch = patch._id;
-    incident.patchStatus = "ready";
-    await incident.save();
-  } catch (err) {
-    console.error("🔥 Automation failed for incident", incidentId, err.message);
-    await Incident.findByIdAndUpdate(incidentId, {
-      analysisStatus: "failed",
-      patchStatus: "failed"
-    });
-  }
-}
-
-// -------------- 2. User triggers MR creation (one-click) --------------
-
-export async function createMRForIncident(incidentId) {
-  const incident = await Incident.findById(incidentId)
-    .populate("project")
-    .populate("aiPatch")
-    .populate("aiAnalysis");
-
-  if (!incident || !incident.project) {
-    throw new Error("Incident or project not found");
-  }
-
-  if (!incident.aiPatch || !incident.aiPatch.diff) {
-    throw new Error("AI patch not ready yet");
-  }
-
-  const project = incident.project;
-  const baseBranch = project.defaultBranch || "main";
-  const branch = `incident-fix-${incident._id}`;
-
-  // 1) Ensure branch exists or create
-  await createBranch(project, branch, baseBranch).catch((err) => {
-    if (err.response?.data?.message === "Branch already exists") {
-      console.log("⚠️ Reusing existing branch", branch);
-    } else {
-      throw err;
+    const filesToSend = [];
+    if (rca?.failingFile) {
+      const found = repoSnapshot.files.find(f => f.path === rca.failingFile);
+      if (found) filesToSend.push(found);
     }
-  });
+    if (filesToSend.length === 0) filesToSend.push(...repoSnapshot.files.slice(0, 12));
 
-  const rawDiff = incident.aiPatch.diff;
-  const diff = cleanDiff(rawDiff);
+    logger.info("[AUTO] Generating patch...");
+    let patchDoc = null;
+    let patchResult = null;
 
-  const filePath = extractFilePath(diff);
-  if (!filePath) {
-    throw new Error("Could not detect file path from diff");
-  }
-
-  const newFile = isNewFile(diff);
-  let updatedContent;
-
-  if (newFile) {
-    console.log("🆕 Creating new file from diff:", filePath);
-    updatedContent = applyPatchNewFile(diff);
-
-    if (!updatedContent || !updatedContent.trim()) {
-      throw new Error("Invalid new-file patch content");
-    }
-
-    await commitFile(
-      project,
-      branch,
-      filePath,
-      updatedContent,
-      `AI created ${filePath} for incident ${incident._id}`,
-      true
-    );
-  } else {
-    console.log("✏️ Updating existing file:", filePath);
-
-    const original = await getFile(project, filePath, baseBranch);
-    updatedContent = applyPatchExistingFile(original, diff);
-
-    if (!updatedContent || !updatedContent.trim()) {
-      throw new Error("Could not apply patch to existing file");
-    }
-
-    await commitFile(
-      project,
-      branch,
-      filePath,
-      updatedContent,
-      `AI patch for ${filePath} (incident ${incident._id})`,
-      false
-    );
-  }
-
-  // 2) Create MR
-  const title = `AI Fix for Incident ${incident._id}`;
-  const description = `
-AI-generated fix for pipeline failure.
-
-Incident: ${incident._id}
-File: ${filePath}
-
-AI Summary: ${incident.aiAnalysis?.summary || "N/A"}
-Root Cause: ${incident.aiAnalysis?.rootCause || "N/A"}
-`;
-
-  const mrData = await createMR(project, branch, title, description);
-
-  const mr = await MergeRequest.create({
-    incident: incident._id,
-    mrId: mrData.id,
-    mrIid: mrData.iid,
-    url: mrData.web_url,
-    branchName: branch,
-    status: mrData.state || "opened",
-    lastCheckedAt: new Date()
-  });
-
-  incident.mergeRequest = mr._id;
-  incident.mrStatus = "open";
-  await incident.save();
-
-  return mr;
-}
-
-// -------------- 3. Handle MR pipeline result (webhook) --------------
-
-export async function handlePostMRPipeline(pipelinePayload, logs) {
-  const ref = pipelinePayload.ref; // branch name
-  const status = pipelinePayload.status; // "success" | "failed" | etc.
-
-  // We only care about branches like "incident-fix-<id>"
-  if (!ref || !ref.startsWith("incident-fix-")) return;
-
-  // Try to find MR by branch
-  const mr = await MergeRequest.findOne({ branchName: ref }).populate("incident");
-  if (!mr || !mr.incident) return;
-
-  const incident = mr.incident;
-
-  if (status === "success") {
-    console.log("✅ MR pipeline succeeded for", ref);
-
-    incident.status = "resolved";
-    incident.mrStatus = "resolved";
-    await incident.save();
-
-    // Clean up related incidents
-    if (incident.category && incident.errorSnippet) {
-      await Incident.deleteMany({
-        _id: { $ne: incident._id },
-        category: incident.category,
-        errorSnippet: incident.errorSnippet
+    try {
+      patchResult = await runPatchGeneration({
+        incident,
+        logs,
+        gitlabCiConfig: ciConfig,
+        files: repoSnapshot.files,
+        targetFiles: repoSnapshot.targetFiles.join("\n"),
+        metadata: { previousPatch: incident.aiPatch ? incident.aiPatch.diff : null, rca }
       });
+
+      patchDoc = await AIPatch.create({
+        incident: incident._id,
+        diff: patchResult.diff || "",
+        description: patchResult.raw ? "AI-generated" : "",
+        risk: "medium",
+        model: patchResult.usedModel || null,
+        safeMode: patchResult.safeMode || false
+      });
+
+      incident.aiPatch = patchDoc._id;
+      incident.patchStatus = "ready";
+      await incident.save();
+    } catch (err) {
+      logger.error("[AUTO] Patch generation error:", err.message || err);
+      patchDoc = patchDoc || new AIPatch({ incident: incident._id, diff: "", description: "Generation error", risk: "high" });
+      incident.patchStatus = "failed";
+      await incident.save();
     }
 
-    return;
-  }
-
-  if (status !== "failed") return;
-
-  console.log("❌ MR pipeline failed for", ref, "→ retrying AI fix");
-
-  // Retry limit for safety
-  if (incident.retryCount >= 3) {
-    incident.mrStatus = "failed";
-    await incident.save();
-    return;
-  }
-
-  incident.retryCount += 1;
-  incident.mrStatus = "fixing";
-  await incident.save();
-
-  // Run a new RCA + patch using latest logs
-  try {
-    const rca = await callRCA({
-      incidentId: incident._id.toString(),
-      logs: logs || incident.fullLogs || "",
-      gitlabCiConfig: incident.gitlabCiConfig || "",
-      metadata: {
-        projectName: "MR retry",
-        pipelineId: pipelinePayload.id,
-        jobName: "mr-pipeline",
-        gitRef: ref
-      }
-    });
-
-    const analysis = await AIAnalysis.create({
-      incident: incident._id,
-      summary: rca.summary,
-      rootCause: rca.rootCause,
-      category: rca.category,
-      confidence: rca.confidence
-    });
-
-    incident.aiAnalysis = analysis._id;
-    await incident.save();
-
-    const patchRes = await callGeneratePatch({
-      incidentId: incident._id.toString(),
-      logs: logs || "",
-      gitlabCiConfig: incident.gitlabCiConfig || "",
-      files: [],
-      metadata: {
-        projectName: "MR retry",
-        pipelineId: pipelinePayload.id,
-        jobName: "mr-pipeline",
-        gitRef: ref
-      }
-    });
-
-    const patch = await AIPatch.create({
-      incident: incident._id,
-      diff: patchRes.diff,
-      description: patchRes.description,
-      riskLevel: patchRes.risk || "medium"
-    });
-
-    incident.aiPatch = patch._id;
-    await incident.save();
-
-    // Apply new patch on same branch
-    const project = await Project.findById(incident.project);
-    if (!project) {
-      throw new Error("Project not found for incident retry");
+    if (!patchDoc || !patchDoc.diff || incident.patchStatus !== "ready") {
+      logger.warn("[AUTO] Patch not ready or empty, skipping validation");
+      if (patchDoc) { patchDoc.status = "failed"; patchDoc.validationError = "Patch missing"; await patchDoc.save(); }
+      incident.patchStatus = "failed"; await incident.save(); return;
     }
 
-    const rawDiff = patch.diff;
-    const diff = cleanDiff(rawDiff);
-    const filePath = extractFilePath(diff);
-    if (!filePath) throw new Error("Could not detect file path from retry diff");
+    logger.info("[AUTO] Validating patch...");
+    const validation = validateUnifiedDiff(patchDoc.diff, repoSnapshot.primaryFileContent);
 
-    const newFile = isNewFile(diff);
-    let updatedContent;
-
-    if (newFile) {
-      updatedContent = applyPatchNewFile(diff);
-      await commitFile(
-        project,
-        mr.branchName,
-        filePath,
-        updatedContent,
-        `AI retry patch created ${filePath}`,
-        true
-      );
-    } else {
-      const original = await getFile(project, filePath, ref);
-      updatedContent = applyPatchExistingFile(original, diff);
-      if (!updatedContent) throw new Error("Could not apply retry patch");
-
-      await commitFile(
-        project,
-        mr.branchName,
-        filePath,
-        updatedContent,
-        `AI retry patch for ${filePath}`,
-        false
-      );
+    if (!validation.ok) {
+      logger.warn("[AUTO] Patch validation failed:", validation.error);
+      patchDoc.validationError = validation.error; patchDoc.status = "failed"; await patchDoc.save();
+      incident.patchStatus = "failed"; incident.analysisStatus = "done"; await incident.save(); return;
     }
 
-    // Pushing commit triggers new pipeline → webhook will handle again
+    patchDoc.status = "valid"; await patchDoc.save();
+    incident.status = "in_progress"; await incident.save();
+    logger.success("[AUTO] Patch validated and ready for MR");
   } catch (err) {
-    console.error("🔥 Retry automation failed:", err.message);
-    incident.mrStatus = "failed";
+    logger.error("[AUTO] Automation internal error:", err.stack || err.message || err);
+    incident.analysisStatus = incident.analysisStatus === "running" ? "failed" : incident.analysisStatus;
+    incident.patchStatus = incident.patchStatus === "running" ? "failed" : incident.patchStatus;
+    incident.retryCount = (incident.retryCount || 0) + 1;
     await incident.save();
   }
 }

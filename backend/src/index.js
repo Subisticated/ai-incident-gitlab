@@ -1,43 +1,36 @@
+// backend/src/index.js
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
-import { connectDB } from "./db/mongoose.js";
-import { errorHandler } from "./middlewares/errorHandler.js";
-
-import healthRouter from "./routes/health.routes.js";
-import projectsRouter from "./routes/projects.routes.js";
-import incidentsRouter from "./routes/incidents.routes.js";
-import webhooksRouter from "./routes/webhooks.routes.js";
+import mongoose from "mongoose";
+import bodyParser from "body-parser";
+import webhooksRouter from "./controllers/webhooks.controller.js";
+import incidentsRouter from "./controllers/incidents.controller.js";
+import logger from "./utils/logger.js";
 
 dotenv.config();
 
-const app = express();
 const PORT = process.env.PORT || 4000;
+const MONGO = process.env.MONGODB_URI || "mongodb://localhost:27017/incident_copilot";
 
-app.use(cors());
-app.use(express.json());
+async function boot() {
+  try {
+    await mongoose.connect(MONGO, { autoIndex: true });
+    logger.success("MongoDB connected to", MONGO);
+  } catch (err) {
+    logger.error("MongoDB connect failed:", err.message || err);
+    process.exit(1);
+  }
 
-// Routes
-app.use("/api/health", healthRouter);
-app.use("/api/projects", projectsRouter);
-app.use("/api/incidents", incidentsRouter);
-app.use("/api/health", healthRouter);
-app.use("/api/projects", projectsRouter);
-app.use("/api/incidents", incidentsRouter);
-app.use("/api/webhooks", webhooksRouter);
+  const app = express();
+  app.use(bodyParser.json({ limit: "5mb" }));
+  app.use(bodyParser.urlencoded({ extended: true }));
 
-// Global error handler
-app.use(errorHandler);
+  app.use("/api/webhooks", webhooksRouter);
+  app.use("/api/incidents", incidentsRouter);
 
-async function start() {
-  await connectDB();
+  app.get("/health", (req, res) => res.json({ success: true, data: { status: "ok", uptime: process.uptime() } }));
 
-  app.listen(PORT, () => {
-    console.log(`🚀 Backend running on port ${PORT}`);
-  });
+  app.listen(PORT, () => logger.success(`Server listening on ${PORT}`));
 }
 
-start().catch((err) => {
-  console.error("Failed to start server:", err.message);
-  process.exit(1);
-});
+boot();

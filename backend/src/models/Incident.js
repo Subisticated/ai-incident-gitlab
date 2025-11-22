@@ -7,12 +7,15 @@ const incidentSchema = new mongoose.Schema(
       ref: "Project",
       required: true
     },
-    pipelineId: { type: Number },
-    pipelineUrl: { type: String },
-    jobId: { type: Number },
-    jobName: { type: String },
-    gitRef: { type: String },
-    commitSha: { type: String },
+
+    pipelineId: Number,
+    pipelineUrl: String,
+
+    jobId: Number,
+    jobName: String,
+
+    gitRef: String,
+    commitSha: String,
 
     status: {
       type: String,
@@ -44,19 +47,22 @@ const incidentSchema = new mongoose.Schema(
       default: null
     },
 
-    errorSnippet: { type: String },
+    errorSnippet: String,
+
     logsStored: { type: Boolean, default: false },
-    fullLogs: { type: String },
-    gitlabCiConfig: { type: String },
+    fullLogs: String,
+    gitlabCiConfig: String,
 
     aiAnalysis: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "AIAnalysis"
     },
+
     aiPatch: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "AIPatch"
     },
+
     mergeRequest: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "MergeRequest"
@@ -67,4 +73,5 @@ const incidentSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-export const Incident = mongoose.model("Incident", incidentSchema);
+export const Incident =
+  mongoose.models.Incident || mongoose.model("Incident", incidentSchema);

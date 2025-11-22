@@ -7,15 +7,18 @@ const aiPatchSchema = new mongoose.Schema(
       ref: "Incident",
       required: true
     },
-    diff: { type: String, required: true },
-    description: { type: String },
-    riskLevel: {
-      type: String,
-      enum: ["low", "medium", "high"],
-      default: "medium"
-    }
+
+    diff: String,
+    description: String,
+    risk: String,
+
+    usedModel: String,
+    safeMode: Boolean,
+
+    previousAttempt: Boolean
   },
   { timestamps: true }
 );
 
-export const AIPatch = mongoose.model("AIPatch", aiPatchSchema);
+export const AIPatch =
+  mongoose.models.AIPatch || mongoose.model("AIPatch", aiPatchSchema);
